@@ -1,0 +1,6 @@
+# En PC: pip install -r requirements.txt
+# En Raspberry Pi: sudo apt-get install -y python3-opencv python3-numpy
+#                 pip install posix-ipc
+opencv-python
+numpy
+posix-ipc

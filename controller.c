@@ -1,9 +1,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
-#include <pigpio.h>
 #include <unistd.h>
 #include <math.h>
+#include <sys/mman.h>
+#include <sys/stat.h>        
+#include <fcntl.h>           
+#include <semaphore.h>
+#include <signal.h>
+
+// Mock de pigpio para poder compilar en PC sin Raspberry
+#ifdef __arm__
+    #include <pigpio.h>
+#else
+    // Simulamos las funciones para que compile en Laptop
+    int gpioInitialise(void) { return 0; }
+    void gpioTerminate(void) { }
+    void gpioServo(unsigned gpio, unsigned pulsewidth) { 
+        printf("[MOCK-GPIO] Pin %d: PulseWidth %d\n", gpio, pulsewidth); 
+    }
+#endif
 
 #define SERVO_PIN 18
 
@@ -13,7 +29,15 @@
 #define MAX_DELTA_ANGLE   5       // Máximo cambio angular por frame (°)
 #define ANGULO_CENTRAL    90      // Posición central del servo (°)
 
-// Estructura compartida entre los hilos
+// Estructura para la Memoria Compartida con Python
+typedef struct {
+    int x;
+    int y;
+    int flags;       // bit 0: quit signal (1 = salir)
+    int frame_width; // ancho real del frame desde Python
+} DatosVision;
+
+// Estructura compartida entre los hilos de C
 typedef struct {
     int angulo_deseado;
     int nuevo_dato; // Bandera para saber si hay un ángulo nuevo
@@ -28,6 +52,16 @@ DatosServo datos_servo = {
     .mutex = PTHREAD_MUTEX_INITIALIZER,
     .cond = PTHREAD_COND_INITIALIZER
 };
+
+// Manejador para cerrar el programa limpiamente
+void cleanup(int signum) {
+    printf("\n[Sistema] Cerrando y limpiando recursos...\n");
+    gpioServo(SERVO_PIN, 0); // Detener el servo
+    gpioTerminate();
+    shm_unlink("/shm_vision");
+    sem_unlink("/sem_vision");
+    exit(0);
+}
 
 // --- HILO 1: Sistema de rotación del servomotor ---
 void* hilo_rotacion_servo(void* arg) {
@@ -72,10 +106,6 @@ void* hilo_rotacion_servo(void* arg) {
 // -------------------------------------------------------------------
 // Función: enviar_rotacion_servo
 // Calcula el nuevo ángulo y lo envía al hilo del servomotor.
-// Parámetros:
-//   x_objeto    - Coordenada X del centro del objeto detectado (px)
-//   ancho_frame - Ancho del frame capturado por la cámara (px)
-//   angulo_actual - Ángulo actual del servo (grados, 0-180)
 // -------------------------------------------------------------------
 void enviar_rotacion_servo(int x_objeto, int ancho_frame, int angulo_actual) {
     int centro = ancho_frame / 2;
@@ -86,21 +116,22 @@ void enviar_rotacion_servo(int x_objeto, int ancho_frame, int angulo_actual) {
         return;
     }
 
-    // Convertir error en píxeles a grados usando el FOV horizontal
+    // Calcular ángulo objetivo directamente desde el centro (proporcional)
     float grados_por_pixel = FOV_HORIZONTAL / (float)ancho_frame;
-    float delta_angulo = (float)error_px * grados_por_pixel;
+    int angulo_target = ANGULO_CENTRAL + (int)((float)error_px * grados_por_pixel);
+
+    // Saturación a los límites físicos del servo
+    if (angulo_target < 0)   angulo_target = 0;
+    if (angulo_target > 180) angulo_target = 180;
 
     // Limitar cambio angular máximo por frame (slew rate)
+    int delta_angulo = angulo_target - angulo_actual;
     if (delta_angulo > MAX_DELTA_ANGLE)
         delta_angulo = MAX_DELTA_ANGLE;
     if (delta_angulo < -MAX_DELTA_ANGLE)
         delta_angulo = -MAX_DELTA_ANGLE;
 
-    int nuevo_angulo = angulo_actual + (int)delta_angulo;
-
-    // Saturación a los límites físicos del servo
-    if (nuevo_angulo < 0)   nuevo_angulo = 0;
-    if (nuevo_angulo > 180) nuevo_angulo = 180;
+    int nuevo_angulo = angulo_actual + delta_angulo;
 
     // Envío al hilo servomotor con exclusión mutua
     pthread_mutex_lock(&datos_servo.mutex);
@@ -109,51 +140,88 @@ void enviar_rotacion_servo(int x_objeto, int ancho_frame, int angulo_actual) {
     pthread_cond_signal(&datos_servo.cond);
     pthread_mutex_unlock(&datos_servo.mutex);
 
-    printf("[Seguimiento] X=%d | error=%d px | delta=%.1f° | ang=%d°\n",
-           x_objeto, error_px, delta_angulo, nuevo_angulo);
+    printf("[Seguimiento] X=%d | error=%d px | target=%d° | ang=%d°\n",
+           x_objeto, error_px, angulo_target, nuevo_angulo);
 }
 
-// --- HILO 2: Sistema de seguimiento (procesamiento de imagen) ---
+// --- HILO 2: Sistema de seguimiento (procesamiento de imagen IPC) ---
 void* hilo_sistema_seguimiento(void* arg) {
     int ancho_frame = 640;
     int angulo_actual = ANGULO_CENTRAL;
 
-    printf("[Seguimiento] Iniciando captura (%d px de ancho)...\n", ancho_frame);
+    printf("[Seguimiento] Inicializando Memoria Compartida...\n");
+
+    // 1. Crear Memoria Compartida
+    int shm_fd = shm_open("/shm_vision", O_CREAT | O_RDWR, 0666);
+    if (shm_fd == -1) {
+        perror("Error en shm_open");
+        pthread_exit(NULL);
+    }
+    ftruncate(shm_fd, sizeof(DatosVision));
+    DatosVision* datos_compartidos = mmap(0, sizeof(DatosVision), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+
+    // 2. Crear Semáforo POSIX
+    sem_t *sem_vision = sem_open("/sem_vision", O_CREAT, 0666, 0);
+    if (sem_vision == SEM_FAILED) {
+        perror("Error creando el semáforo");
+        pthread_exit(NULL);
+    }
+
+    printf("[Seguimiento] Listo. Esperando datos de Python...\n");
 
     while (1) {
-        // ---------------------------------------------------------------
-        // BLOQUE DE ADQUISICIÓN
-        // El hilo de captura deposita el frame en un buffer compartido.
+        sem_wait(sem_vision);
 
+        // Actualizar ancho del frame desde Python
+        if (datos_compartidos->frame_width > 0) {
+            ancho_frame = datos_compartidos->frame_width;
+        }
 
-        // ---------------------------------------------------------------
-        // BLOQUE DE PROCESAMIENTO
-        // Detección del objeto por color usando OpenCV.
+        // Señal de salida desde Python (tecla Q)
+        if (datos_compartidos->flags & 1) {
+            printf("[Seguimiento] Señal de salida recibida de Python. Cerrando...\n");
+            pthread_mutex_lock(&datos_servo.mutex);
+            datos_servo.angulo_deseado = 90;
+            datos_servo.nuevo_dato = 1;
+            pthread_cond_signal(&datos_servo.cond);
+            pthread_mutex_unlock(&datos_servo.mutex);
+            usleep(50000);
+            break;
+        }
 
-        // Actualizar ángulo local desde la variable compartida
+        int objeto_x = datos_compartidos->x;
+
         pthread_mutex_lock(&datos_servo.mutex);
         angulo_actual = datos_servo.angulo_deseado;
         pthread_mutex_unlock(&datos_servo.mutex);
 
-        usleep(33000); // ~33 ms → ~30 FPS
+        enviar_rotacion_servo(objeto_x, ancho_frame, angulo_actual);
     }
 
-    pthread_exit(NULL);
+    gpioServo(SERVO_PIN, 0);
+    gpioTerminate();
+    shm_unlink("/shm_vision");
+    sem_unlink("/sem_vision");
+    exit(0);
 }
 
 int main() {
     pthread_t thread_servo;
     pthread_t thread_seguimiento;
 
-    printf("Iniciando sistema de seguimiento por cámara...\n");
+    // Registrar el manejador de señales (Ctrl+C)
+    signal(SIGINT, cleanup);
+    signal(SIGTERM, cleanup);
 
-    // 1. Iniciar el hilo del Servomotor
+    printf("Iniciando sistema de control en C...\n");
+
+    // Limpieza inicial por si acaso
+    shm_unlink("/shm_vision");
+    sem_unlink("/sem_vision");
+
     pthread_create(&thread_servo, NULL, hilo_rotacion_servo, NULL);
-
-    // 2. Iniciar el hilo de Seguimiento (procesamiento de imagen)
     pthread_create(&thread_seguimiento, NULL, hilo_sistema_seguimiento, NULL);
 
-    // Esperamos a que los hilos terminen (loops infinitos)
     pthread_join(thread_servo, NULL);
     pthread_join(thread_seguimiento, NULL);
 
