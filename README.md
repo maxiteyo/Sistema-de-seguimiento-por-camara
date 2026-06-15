@@ -302,7 +302,7 @@ sudo apt-get update || true
 |---------|------|
 | `colorv4.py` | Captura video, filtrado HSV, detección de color, IPC hacia C |
 | `controller.c` | IPC desde Python, control de servo MG996R (o simulación) |
-| `defines.h` | Constantes compartidas (FOV, deadband, servo limits) |
+| `defines.h` | Constantes compartidas (deadband, servo limits) |
 | `requirements.txt` | opencv-python, numpy, posix-ipc |
 
 ## Conceptos de Sistemas de Tiempo Real Aplicados
@@ -345,9 +345,9 @@ typedef struct {
 Semáforo contador inicializado en 0. Funciona como **mecanismo de notificación**
 entre procesos: Python incrementa (produce) y C decrementa (consume).
 
-**Uso de `sem_timedwait` con timeout de 1 segundo:**
+**Uso de `sem_timedwait` con timeout de 100ms:**
 - Evita que C se bloquee indefinidamente si Python falla (cuelga o crash)
-- Timeout de 1s elegido como balance entre reactividad y uso de CPU
+- Timeout de 100ms permite re-adquirir el objeto rápidamente tras oclusión momentánea
 
 ### Mutex (`pthread_mutex_t`)
 
@@ -379,10 +379,11 @@ El manejador de `SIGINT`/`SIGTERM` es **async-signal-safe**:
 
 **Archivo:** `controller.c` y `defines.h`
 
-`MAX_DELTA_ANGLE = 15` limita el cambio máximo de ángulo por frame. Esto:
-- Protege el servo de cambios bruscos que podrían dañar los engranajes
-- Limita la velocidad angular a ~225°/s a 15 FPS (compatible con el MG996R)
-- Evita oscilaciones por sobrepaso (overshoot)
+`MAX_DELTA_ANGLE = 5` limita el cambio máximo de ángulo por frame, con
+velocidad proporcional al error. Esto:
+- Reduce la velocidad angular máxima a ~75°/s a 15 FPS (más suave que antes)
+- Evita oscilaciones por sobrepaso (overshoot) al no mover más de lo necesario
+- El redondeo garantiza al menos 1°/frame incluso para errores pequeños
 
 ### Deadband (Zona Muerta)
 
@@ -392,20 +393,33 @@ El manejador de `SIGINT`/`SIGTERM` es **async-signal-safe**:
 Esto evita micro-correcciones constantes cuando el objeto está prácticamente centrado.
 Técnica clásica de control para eliminar el chatter del actuador.
 
-### Control Proporcional (P)
+### Control Proporcional (Velocidad)
 
-El control es puramente proporcional:
+El control calcula un delta de ángulo proporcional al error de píxeles:
 ```
 error_px = x_objeto - centro
-angulo_target = ANGULO_CENTRAL + error_px * (FOV / ancho)
+error_ratio = error_px / (ancho_frame / 2)
+delta = error_ratio * MAX_DELTA_ANGLE
+nuevo_angulo = actual + delta
 ```
 
-La ganancia `Kp = FOV / ancho_frame` convierte píxeles a grados. Con
-FOV=60° y ancho=320px, Kp = 0.1875 °/px.
+El delta usa **redondeo matemático** (no truncado) y garantiza al menos 1°/frame
+para cualquier error fuera de la deadband. Esto evita el "pegado" por truncado a 0.
+
+La velocidad es proporcional al error:
+| Error en px | Error ratio | Delta (°) | Comportamiento |
+|:-----------:|:-----------:|:---------:|----------------|
+| 16 | 0.10 | 1 | Corrección suave, centrado fino |
+| 80 | 0.50 | 3 | Respuesta media |
+| 160 | 1.00 | 5 | Velocidad máxima |
+
+El rango completo de 0° a 180° se alcanza naturalmente: como el delta siempre apunta
+en la dirección del error, el servo sigue moviéndose hasta que el objeto entra en la
+deadband.
 
 No hay término integral (I) porque:
 - El sistema mecánico no tiene error de estado estacionario apreciable
-- Un integrador podría causar windup (especialmente con objetos que se detienen en los bordes del frame)
+- Un integrador podría causar windup
 
 No hay término derivativo (D) porque:
 - El EMA filter en Python ya suaviza la entrada
@@ -420,9 +434,9 @@ No hay término derivativo (D) porque:
 | Mutex | Exclusión mutua entre hilos C sobre `DatosServo` | ✅ |
 | Condvar | Despertar selectivo del hilo servo cuando hay nuevo ángulo | ✅ |
 | Signal Handler | Manejador async-signal-safe (`write()` + `_exit()`) | ✅ |
-| Slew Rate | Limitador de velocidad angular del servo (15°/frame) | ✅ |
+| Slew Rate | Limitador de velocidad angular del servo (5°/frame máx) | ✅ |
 | Deadband | Zona muerta de ±15px para evitar micro-oscilaciones | ✅ |
-| Control P | Control proporcional píxel→grado | ✅ |
+| Control P (Velocidad) | Control proporcional con redondeo y 1°/frame mínimo | ✅ |
 | EMA Filter | Suavizado exponencial 70/30 sobre posición X | ✅ |
 | SCHED_FIFO | [Documentado] Planificación tiempo real prioritaria | ❌ No activo |
 | Memory Locking | [Documentado] `mlockall` para evitar page faults | ❌ No activo |
@@ -481,3 +495,17 @@ rangos combinados.
 
 **defines.h:**
 - Creado como header compartido de constantes del sistema
+
+### v2.3 — Control por velocidad con redondeo y suavizado (ACTUAL)
+
+**controller.c:**
+- Vuelta a control por velocidad (`delta = error_ratio * MAX_DELTA`) con dos mejoras clave:
+  - **Redondeo matemático** (`(int)(delta_f + 0.5f)`) en vez de truncado — evita delta=0 para errores pequeños
+  - **Garantía de 1°/frame mínimo** para cualquier error fuera de deadband — elimina el "pegado"
+- El rango completo 0-180° se alcanza naturalmente: el servo se mueve en la dirección del error hasta entrar en deadband
+
+**defines.h:**
+- `MAX_DELTA_ANGLE` reducido de 8 a 5 para movimientos más suaves (75°/s máx)
+
+**README.md:**
+- Secciones de control, slew rate y tabla actualizadas
