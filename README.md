@@ -163,13 +163,20 @@ source .venv/bin/activate
 python3 colorv4.py
 ```
 
-**En Raspberry Pi (desde VNC o con monitor conectado):**
+**En Raspberry Pi — necesario desde VNC o con monitor HDMI:**
+
+> ❌ **No funciona por SSH.** OpenCV necesita una pantalla para mostrar la ventana de la cámara.
+> Conectate primero por VNC (ver sección [VNC con TigerVNC](#vnc-con-tigervnc--ver-la-cámara-desde-tu-pc-sin-monitor)).
+
+Una vez conectado por VNC, abrí una terminal en el escritorio de la Pi y ejecutá:
 
 ```bash
+cd ~/grupo3
 sudo .venv/bin/python3 colorv4.py
 ```
 
-> En la Pi se necesita `sudo` porque la memoria compartida fue creada por `root` (el C se ejecuta con `sudo`).
+> En la Pi se necesita `sudo` porque la memoria compartida fue creada por `root` (el C arranca con `sudo`).
+> El C y Python pueden correr en la misma terminal de VNC pero en distinto orden: primero C, después Python.
 
 Deberías ver:
 ```
@@ -295,4 +302,182 @@ sudo apt-get update || true
 |---------|------|
 | `colorv4.py` | Captura video, filtrado HSV, detección de color, IPC hacia C |
 | `controller.c` | IPC desde Python, control de servo MG996R (o simulación) |
+| `defines.h` | Constantes compartidas (FOV, deadband, servo limits) |
 | `requirements.txt` | opencv-python, numpy, posix-ipc |
+
+## Conceptos de Sistemas de Tiempo Real Aplicados
+
+Este proyecto implementa varios conceptos fundamentales de sistemas de tiempo real
+vistos en la materia del IUA. A continuación se detalla cada uno y cómo se aplica.
+
+### Memoria Compartida (`shm_open` + `mmap`)
+
+**Archivo:** `controller.c:150-156`, `colorv4.py:11-13`
+
+Se usa para transferir coordenadas del objeto detectado desde el proceso Python
+(visión) al proceso C (control del servo). La memoria compartida POSIX permite
+que ambos procesos accedan a la misma región de RAM sin copiar datos.
+
+**Sincronización:** el patrón es estrictamente productor-consumidor:
+1. Python escribe las coordenadas en la shared memory
+2. Python hace `sem_post` (libera al consumidor)
+3. C hace `sem_timedwait` (consume) y lee
+
+Como hay un solo escritor y un solo lector coordinados por semáforo, no se
+necesita mutex adicional sobre la shared memory. La operación de escritura
+(`struct.pack` + `mmap.write`) es suficientemente rápida como para que la
+exclusión por semáforo garantice consistencia.
+
+**Estructura de datos intercambiada** (`DatosVision` en `controller.c:28-33`):
+```c
+typedef struct {
+    int x;           // centro X del objeto (píxeles)
+    int y;           // centro Y del objeto (píxeles)
+    int flags;       // bit 0: señal de quit (1 = cerrar)
+    int frame_width; // ancho real del frame (para calcular FOV)
+} DatosVision;
+```
+
+### Semáforo POSIX (`sem_open`, `sem_timedwait`)
+
+**Archivo:** `controller.c` y `colorv4.py`
+
+Semáforo contador inicializado en 0. Funciona como **mecanismo de notificación**
+entre procesos: Python incrementa (produce) y C decrementa (consume).
+
+**Uso de `sem_timedwait` con timeout de 1 segundo:**
+- Evita que C se bloquee indefinidamente si Python falla (cuelga o crash)
+- Timeout de 1s elegido como balance entre reactividad y uso de CPU
+
+### Mutex (`pthread_mutex_t`)
+
+Protege la estructura `DatosServo` compartida entre los dos hilos de C:
+- **Hilo de tracking**: escribe `angulo_deseado` y señaliza la condvar
+- **Hilo de servo**: lee `angulo_deseado` y mueve el motor
+
+**Propiedades de la implementación:**
+- Secciones críticas muy cortas (< 10 instrucciones)
+- Sin anidamiento de locks (deadlock imposible)
+- Lock time mínimo: solo lo necesario para copiar el ángulo
+- Inicialización estática con `PTHREAD_MUTEX_INITIALIZER`
+
+### Variable de Condición (`pthread_cond_wait` + `pthread_cond_signal`)
+
+Mecanismo para dormir el hilo del servo hasta que haya un nuevo ángulo disponible.
+- El hilo de tracking calcula el nuevo ángulo y hace `pthread_cond_signal`
+- El hilo de servo despierta con `pthread_cond_wait`, lee el ángulo, mueve el servo
+- Inicialización estática con `PTHREAD_COND_INITIALIZER`
+
+### Signal Handler Async-Signal-Safe
+
+El manejador de `SIGINT`/`SIGTERM` es **async-signal-safe**:
+- Usa `write()` en lugar de `printf()` (que no es segura en contexto de señal)
+- Llama a `_exit(0)` en lugar de `exit(0)` (versión segura que no ejecuta handlers de atexit ni limpia buffers de stdio)
+- No usa variables globales compartidas
+
+### Slew Rate / Rate Limiter
+
+**Archivo:** `controller.c` y `defines.h`
+
+`MAX_DELTA_ANGLE = 15` limita el cambio máximo de ángulo por frame. Esto:
+- Protege el servo de cambios bruscos que podrían dañar los engranajes
+- Limita la velocidad angular a ~225°/s a 15 FPS (compatible con el MG996R)
+- Evita oscilaciones por sobrepaso (overshoot)
+
+### Deadband (Zona Muerta)
+
+**Archivo:** `controller.c` y `defines.h`
+
+`DEADBAND_PX = 15` crea una zona alrededor del centro donde el servo no se mueve.
+Esto evita micro-correcciones constantes cuando el objeto está prácticamente centrado.
+Técnica clásica de control para eliminar el chatter del actuador.
+
+### Control Proporcional (P)
+
+El control es puramente proporcional:
+```
+error_px = x_objeto - centro
+angulo_target = ANGULO_CENTRAL + error_px * (FOV / ancho)
+```
+
+La ganancia `Kp = FOV / ancho_frame` convierte píxeles a grados. Con
+FOV=60° y ancho=320px, Kp = 0.1875 °/px.
+
+No hay término integral (I) porque:
+- El sistema mecánico no tiene error de estado estacionario apreciable
+- Un integrador podría causar windup (especialmente con objetos que se detienen en los bordes del frame)
+
+No hay término derivativo (D) porque:
+- El EMA filter en Python ya suaviza la entrada
+- La derivada amplificaría ruido de detección
+
+### Resumen de Conceptos RTOS Utilizados
+
+| Concepto | Descripción | Implementado |
+|----------|-------------|:------------:|
+| Memoria Compartida | IPC C↔Python vía `shm_open` + `mmap` sin copia de datos | ✅ |
+| Semáforo POSIX | Notificación productor-consumidor entre procesos | ✅ |
+| Mutex | Exclusión mutua entre hilos C sobre `DatosServo` | ✅ |
+| Condvar | Despertar selectivo del hilo servo cuando hay nuevo ángulo | ✅ |
+| Signal Handler | Manejador async-signal-safe (`write()` + `_exit()`) | ✅ |
+| Slew Rate | Limitador de velocidad angular del servo (15°/frame) | ✅ |
+| Deadband | Zona muerta de ±15px para evitar micro-oscilaciones | ✅ |
+| Control P | Control proporcional píxel→grado | ✅ |
+| EMA Filter | Suavizado exponencial 70/30 sobre posición X | ✅ |
+| SCHED_FIFO | [Documentado] Planificación tiempo real prioritaria | ❌ No activo |
+| Memory Locking | [Documentado] `mlockall` para evitar page faults | ❌ No activo |
+| Watchdog | [Documentado] Timeout de seguridad para centrar servo | ❌ No activo |
+
+## Detección de Objetos — Algoritmo de Visión
+
+### Pipeline de Procesamiento de Imagen (`colorv4.py`)
+
+```
+Frame raw (320x240)
+  → BGR → HSV (separar color de iluminación)
+  → Threshold HSV por color seleccionado
+    ─ Rojo: dos rangos [0-10] ∪ [160-180] combinados con bitwise_or
+    ─ Verde/azul: un único rango
+  → MORPH_OPEN (erode + dilate: elimina ruido blanco aislado)
+  → MORPH_CLOSE (dilate + erode: rellena huecos dentro del objeto)
+  → findContours con RETR_EXTERNAL (solo contornos exteriores)
+  → Filtro por área (> 300 px²)
+  → Selección del contorno de mayor área
+  → Filtro EMA (70% anterior + 30% nuevo) para estabilidad del servo
+  → Envío por shared memory + sem_post al controlador C
+```
+
+### Rangos HSV Configurados
+
+| Color | Lower H | Upper H | Lower S | Upper S | Lower V | Upper V |
+|-------|---------|---------|---------|---------|---------|---------|
+| Rojo 1 | 0 | 10 | 120 | 255 | 120 | 255 |
+| Rojo 2 | 160 | 180 | 120 | 255 | 120 | 255 |
+| Verde | 35 | 85 | 80 | 255 | 80 | 255 |
+| Azul | 94 | 120 | 80 | 255 | 80 | 255 |
+
+Nota: El rojo en OpenCV HSV tiene H en rango 0-179. El color rojo real se
+encuentra alrededor de H=0 y H=170-180 (envuelve). Por eso se necesitan dos
+rangos combinados.
+
+## Historial de Cambios
+
+### v2.1 — Correcciones de tracking
+
+**colorv4.py (mejoras de detección):**
+- Cambiado a `MORPH_OPEN` + `MORPH_CLOSE` (antes solo `MORPH_CLOSE`, Open rellena ruido y Close rellena huecos)
+- Cambiado a `RETR_EXTERNAL` (antes `RETR_TREE` — detectaba contornos anidados innecesarios)
+- Rojo: doble rango HSV combinado con `bitwise_or` (H<10 ∪ H>160), con S/V≥120
+- Verde: rango HSV con S/V≥80
+- Azul: rango HSV con S/V≥80 (corregido V inferior de 2 a 80 que dejaba pasar cualquier pixel)
+- Estructura general idéntica al original (namedWindow, try, while loop)
+
+**controller.c (solo mejoras de seguridad mínimas):**
+- `sem_timedwait` con timeout de 1s (original usaba `sem_wait` que bloqueaba infinitamente)
+- Manejador de señal async-signal-safe (`write()` + `_exit()`, original usaba `printf()` + `exit()`)
+- Verificación de errores en `pthread_create`
+- Header `defines.h` para constantes compartidas
+- Todo lo demás: idéntico al original (sin SCHED_FIFO, sin mlockall, sin watchdog, sin sigaction, sin quit_flag, con `pthread_cond_wait` y `exit(0)` originales)
+
+**defines.h:**
+- Creado como header compartido de constantes del sistema
